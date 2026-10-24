@@ -1,0 +1,1575 @@
+"""
+╔══════════════════════════════════════════════════════════════╗
+║              ⬡  STELLAR VIDEO DOWNLOADER  v3.0               ║
+║         Multi-Engine · Downloads from ANY website            ║
+╠══════════════════════════════════════════════════════════════╣
+║  ENGINE 1 → yt-dlp      (1000+ sites, fastest)              ║
+║  ENGINE 2 → Browser      (Playwright headless, intercepts    ║
+║                           real video streams like DevTools)   ║
+║  ENGINE 3 → Direct Scan  (HTML scraping for video URLs)      ║
+╚══════════════════════════════════════════════════════════════╝
+
+Setup (run once):
+    pip install customtkinter yt-dlp playwright requests
+    python -m playwright install chromium
+"""
+
+import customtkinter as ctk
+import threading
+
+import os
+import sys
+import re
+import subprocess
+import time
+import shutil
+from pathlib import Path
+from datetime import timedelta
+from urllib.parse import urlparse
+
+# ── Dependency check & import ─────────────────────────────────
+def ensure_package(pkg, pip_name=None):
+    try:
+        __import__(pkg)
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pip_name or pkg])
+
+ensure_package("yt_dlp", "yt-dlp")
+ensure_package("curl_cffi", "yt-dlp[curl-cffi]")  # browser TLS impersonation (Cloudflare bypass)
+ensure_package("requests")
+
+import yt_dlp
+import requests
+
+
+# ══════════════════════════════════════════════════════════════
+#  THEME & COLORS
+# ══════════════════════════════════════════════════════════════
+COLORS = {
+    "bg_dark":       "#0B0B0F",
+    "bg_card":       "#15151C",
+    "bg_input":      "#111118",
+    "accent":        "#6C5CE7",
+    "accent_hover":  "#8B7CF7",
+    "accent_dim":    "#2A2540",
+    "success":       "#00E676",
+    "warning":       "#FFB300",
+    "error":         "#FF5252",
+    "engine1":       "#6C5CE7",
+    "engine2":       "#00B894",
+    "engine3":       "#FDCB6E",
+    "text_primary":  "#F0F0F5",
+    "text_secondary":"#8888A0",
+    "text_muted":    "#50506A",
+    "border":        "#222233",
+    "progress_bg":   "#1A1A28",
+    "card_hover":    "#1E1E2E",
+}
+
+FONT = "Segoe UI"
+
+# ══════════════════════════════════════════════════════════════
+#  VIDEO EXTENSIONS & PATTERNS
+# ══════════════════════════════════════════════════════════════
+VIDEO_EXTENSIONS = {
+    ".mp4", ".webm", ".m3u8", ".mpd", ".ts", ".flv",
+    ".avi", ".mkv", ".mov", ".m4v", ".f4v", ".ogv",
+}
+VIDEO_MIME_TYPES = {
+    "video/", "application/x-mpegurl", "application/dash+xml",
+    "application/vnd.apple.mpegurl", "application/octet-stream",
+}
+MIN_VIDEO_SIZE = 500_000  # 500 KB
+
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
+# Hosts / path fragments that serve ads rather than page content.
+# Any intercepted stream matching one of these is treated as an ad and
+# only used if absolutely nothing else was found.
+AD_PATTERNS = [
+    "doubleclick.net", "googlesyndication", "googleadservices", "imasdk.googleapis",
+    "pubads", "adservice.google", "2mdn.net", "gvt1.com",
+    "adnxs.com", "adsrvr.org", "adform.net", "rubiconproject", "pubmatic", "openx.net",
+    "criteo", "smartadserver", "teads.tv", "unrulymedia", "fwmrm.net", "freewheel",
+    "innovid", "adsafeprotected", "moatads", "serverbid", "yieldmo", "casalemedia",
+    "bidswitch", "spotxchange", "spotx.tv", "springserve", "adtelligent", "aniview",
+    "exoclick", "exosrv", "trafficjunky", "juicyads", "adtng", "tsyndicate", "adsco.re",
+    "popads", "propellerads", "mgid.com", "taboola", "outbrain", "revcontent",
+    "ad-delivery", "adsystem", "adserver", "adsserver", "advertising", "advert",
+    "/ads/", "/ad/", "/adv/", "/vast", "vast.xml", "vpaid", "preroll", "pre-roll",
+    "midroll", "ad_type=", "adtag", "ad-tag", "adunit", "ad_unit", "/banner",
+    "zoneid=", "zone_id=", "/zv3/", "adtng.com", "flixcdn.com/xc",
+]
+
+# Hover thumbnails / teaser clips: real files, but never the video the user wants.
+PREVIEW_PATTERNS = ["preview", "/thumb", "thumbs/", "teaser", "trailer_", "heatmap", "sprite"]
+
+MANIFEST_MIME_TYPES = ("mpegurl", "dash+xml", "vnd.apple.mpegurl")
+
+
+def cookies_for_url(cookies, url):
+    """Browser cookies (Playwright dicts) that apply to this URL -> 'a=b; c=d'."""
+    host = urlparse(url).hostname or ""
+    out = []
+    for c in cookies or []:
+        dom = (c.get("domain") or "").lstrip(".").lower()
+        if dom and (host == dom or host.endswith("." + dom)):
+            out.append(f"{c['name']}={c['value']}")
+    return "; ".join(out)
+
+
+def write_cookie_jar(cookies, path):
+    """Dump Playwright cookies as a Netscape cookie file for yt-dlp."""
+    lines = ["# Netscape HTTP Cookie File", ""]
+    for c in cookies or []:
+        dom = c.get("domain") or ""
+        exp = c.get("expires") or 0
+        exp = int(exp) if exp and exp > 0 else 0
+        lines.append("\t".join([
+            dom, "TRUE" if dom.startswith(".") else "FALSE", c.get("path") or "/",
+            "TRUE" if c.get("secure") else "FALSE", str(exp), c["name"], c["value"],
+        ]))
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return path
+
+
+def impersonate_target():
+    """ImpersonateTarget for yt-dlp if curl_cffi is installed, else None."""
+    try:
+        import curl_cffi  # noqa: F401
+        from yt_dlp.networking.impersonate import ImpersonateTarget
+        return ImpersonateTarget("chrome")
+    except Exception:
+        return None
+
+
+def classify_stream_url(url, content_type=""):
+    """Return (is_ad, is_segment, is_manifest) for an intercepted URL."""
+    u = url.lower()
+    path = urlparse(u).path
+    is_ad = any(pat in u for pat in AD_PATTERNS)
+    # Many CDNs serve playlists from tokenised paths with no .m3u8 extension;
+    # the Content-Type is the reliable signal there.
+    is_manifest = (".m3u8" in path or ".mpd" in path
+                   or any(m in (content_type or "").lower() for m in MANIFEST_MIME_TYPES))
+    is_segment = (not is_manifest) and (
+        any(path.endswith(ext) for ext in (".ts", ".m4s", ".m4f")) or
+        any(pat in path for pat in ("/seg", "segment", "chunk", "frag", "init.mp4"))
+    )
+    return is_ad, is_segment, is_manifest
+
+
+def probe_stream_duration(url, referer=None, timeout=8):
+    """
+    Best-effort (duration_seconds, is_master_playlist) of an HLS/DASH manifest.
+    Pre-roll ads are 6-30s; real content is minutes. This is the single
+    most reliable way to tell them apart.
+    """
+    is_master = False
+    from urllib.parse import urljoin
+    headers = {}
+    if referer:
+        headers["Referer"] = referer
+
+    def fetch(u):
+        # Manifests on Cloudflare-protected sites need a browser TLS fingerprint
+        try:
+            from curl_cffi import requests as cffi_requests
+            r = cffi_requests.get(u, headers=headers, impersonate="chrome", timeout=timeout)
+        except ImportError:
+            r = requests.get(u, headers=dict(headers, **{"User-Agent": BROWSER_UA}), timeout=timeout)
+        if r.status_code != 200:
+            raise RuntimeError(f"HTTP {r.status_code}")
+        return r.text
+
+    try:
+        text = fetch(url)
+        if ".mpd" in url.lower() or "<MPD" in text[:500]:
+            m = re.search(r'mediaPresentationDuration="PT(?:(\d+)H)?(?:(\d+)M)?(?:([\d.]+)S)?"', text)
+            if m:
+                h, mi, sec = (float(x) if x else 0 for x in m.groups())
+                return h * 3600 + mi * 60 + sec, True
+            return 0, True
+        if "#EXT-X-STREAM-INF" in text:  # master playlist -> follow first variant
+            is_master = True
+            variant = next((l.strip() for l in text.splitlines()
+                            if l.strip() and not l.startswith("#")), None)
+            if not variant:
+                return 0, is_master
+            text = fetch(urljoin(url, variant))
+        return sum(float(x) for x in re.findall(r"#EXTINF:([\d.]+)", text)), is_master
+    except Exception:
+        return 0, is_master
+
+
+# ══════════════════════════════════════════════════════════════
+#  ENGINE 2: PLAYWRIGHT BROWSER INTERCEPTOR
+# ══════════════════════════════════════════════════════════════
+class BrowserInterceptor:
+    """
+    Opens a real headless Chromium browser, navigates to the URL,
+    and intercepts ALL network responses to find video streams.
+    Works like DevTools Network tab — catches everything.
+    """
+
+    @staticmethod
+    def is_available():
+        try:
+            from playwright.sync_api import sync_playwright
+            return True
+        except ImportError:
+            return False
+
+    @staticmethod
+    def install():
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "playwright"])
+        subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
+
+    @staticmethod
+    def find_video_urls(page_url, log_callback=None, timeout=30):
+        """
+        Navigate to page_url in a real browser and intercept all
+        network traffic to find video stream URLs.
+        Returns list of dicts: [{url, content_type, size}, ...]
+        """
+        from playwright.sync_api import sync_playwright
+
+        found_videos = []
+        seen_urls = set()
+
+        def log(msg):
+            if log_callback:
+                log_callback(msg)
+
+        log("   Launching headless Chromium...")
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-web-security",
+                ]
+            )
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                viewport={"width": 1920, "height": 1080},
+                java_script_enabled=True,
+                bypass_csp=True,
+            )
+            page = context.new_page()
+
+            def on_response(response):
+                try:
+                    url = response.url
+                    if url in seen_urls:
+                        return
+                    seen_urls.add(url)
+
+                    content_type = response.headers.get("content-type", "")
+                    content_length = int(response.headers.get("content-length", 0))
+
+                    parsed = urlparse(url)
+                    path_lower = parsed.path.lower()
+                    has_video_ext = any(path_lower.endswith(ext) for ext in VIDEO_EXTENSIONS)
+                    has_video_mime = any(mime in content_type.lower() for mime in VIDEO_MIME_TYPES)
+                    is_video_cdn = any(pat in url.lower() for pat in [
+                        "/video", "/media", "/stream", "/hls/", "/dash/",
+                        ".m3u8", ".mpd", "/manifest", "/playlist",
+                        "googlevideo.com", "videoplayback", "cdn",
+                    ])
+
+                    if has_video_ext or has_video_mime or (is_video_cdn and content_length > MIN_VIDEO_SIZE):
+                        is_ad, is_segment, is_manifest = classify_stream_url(url, content_type)
+                        # Ad SDKs load lots of tiny ad assets; don't pollute the candidate list
+                        if is_ad and not (is_manifest or has_video_ext or has_video_mime):
+                            return
+                        entry = {
+                            "url": url,
+                            "content_type": content_type,
+                            "size": content_length,
+                            "is_ad": is_ad,
+                            "is_segment": is_segment,
+                            "is_manifest": is_manifest,
+                            "t": time.time() - t_start,
+                        }
+                        try:
+                            # exact headers the real player sent (Referer/Origin/tokens)
+                            entry["req_headers"] = response.request.all_headers()
+                        except Exception:
+                            entry["req_headers"] = {}
+                        found_videos.append(entry)
+                        if is_segment:
+                            return  # keep quiet about individual chunks
+                        size_str = f"{content_length / 1024 / 1024:.1f} MB" if content_length else "? size"
+                        tag = "🚫 Ad stream" if is_ad else ("🎯 Manifest" if is_manifest else "🎯 Found")
+                        log(f"   {tag}: {content_type or 'video'} ({size_str}) {urlparse(url).netloc}")
+
+                except Exception:
+                    pass
+
+            t_start = time.time()
+            page.on("response", on_response)
+
+            log(f"   Navigating to page...")
+            try:
+                page.goto(page_url, wait_until="domcontentloaded", timeout=min(timeout, 25) * 1000)
+            except Exception as e:
+                log(f"   ⚠ Nav warning: {str(e)[:80]}")
+            log(f"   (page loaded in {time.time() - t_start:.0f}s)")
+            try:
+                page_title = page.title()
+            except Exception:
+                page_title = ""
+
+            # Wait for video player to initialize
+            log("   Waiting for video player...")
+            page.wait_for_timeout(3000)
+
+            # Try clicking play buttons
+            play_selectors = [
+                "button[class*='play']", "[class*='play-btn']",
+                "[class*='player'] button", "video", ".vjs-big-play-button",
+                "[aria-label*='play' i]", "[title*='play' i]",
+                ".play-button", "#play-button", ".btn-play",
+            ]
+            for selector in play_selectors:
+                try:
+                    el = page.query_selector(selector)
+                    if el and el.is_visible():
+                        # Short timeout: ad overlays often cover the button and
+                        # Playwright would otherwise wait 30s per selector.
+                        el.click(timeout=1500)
+                        log("   ▶ Clicked play button")
+                        break
+                except Exception:
+                    continue
+
+            # Keep listening through the pre-roll. Ads play first and the real
+            # player often only requests its manifest once the ad finishes, so
+            # we poll until a non-ad stream shows up (or we run out of time).
+            def good_candidates():
+                return [v for v in found_videos if not v["is_ad"] and not v["is_segment"]]
+
+            def dom_video_state():
+                try:
+                    return page.evaluate("""
+                        () => Array.from(document.querySelectorAll('video')).map(v => ({
+                            src: v.currentSrc || v.src || '',
+                            duration: (isFinite(v.duration) ? v.duration : 0),
+                            paused: v.paused,
+                        }))
+                    """) or []
+                except Exception:
+                    return []
+
+            log("   ⏳ Listening for the real stream (skipping ads)...")
+            deadline = time.time() + max(timeout - 5, 15)
+            content_seen_at = None
+            while time.time() < deadline:
+                page.wait_for_timeout(1500)
+                vids = dom_video_state()
+                long_vid = max((v["duration"] for v in vids), default=0)
+                good = good_candidates()
+                if good and content_seen_at is None:
+                    content_seen_at = time.time()
+                    log(f"   ✓ Non-ad stream detected after {good[0]['t']:.0f}s")
+                # A <video> element reporting minutes of content = main video is up
+                if good and long_vid >= 60:
+                    log(f"   ✓ Player reports {long_vid/60:.1f} min of content")
+                    break
+                # Give the player a few seconds after the first good stream to
+                # also fetch the master playlist / higher qualities, then stop
+                if content_seen_at and time.time() - content_seen_at > 6:
+                    break
+
+            # Remember durations the DOM told us about (direct src players)
+            for v in dom_video_state():
+                src = v.get("src") or ""
+                for entry in found_videos:
+                    if src and src == entry["url"] and v.get("duration"):
+                        entry["duration"] = v["duration"]
+
+            # Extract video src from DOM
+            try:
+                video_srcs = page.evaluate("""
+                    () => {
+                        const urls = new Set();
+                        document.querySelectorAll('video, video source, source').forEach(el => {
+                            if (el.src) urls.add(el.src);
+                            if (el.currentSrc) urls.add(el.currentSrc);
+                        });
+                        document.querySelectorAll('iframe').forEach(el => {
+                            if (el.src) urls.add(el.src);
+                        });
+                        document.querySelectorAll('meta[property="og:video"], meta[property="og:video:url"]').forEach(el => {
+                            if (el.content) urls.add(el.content);
+                        });
+                        document.querySelectorAll('script[type="application/ld+json"]').forEach(el => {
+                            try {
+                                const data = JSON.parse(el.textContent);
+                                if (data.contentUrl) urls.add(data.contentUrl);
+                                if (data.embedUrl) urls.add(data.embedUrl);
+                            } catch {}
+                        });
+                        return [...urls].filter(u => u && u.startsWith('http'));
+                    }
+                """)
+                for src in video_srcs:
+                    if src not in seen_urls:
+                        is_ad, is_segment, is_manifest = classify_stream_url(src)
+                        src_path = urlparse(src.lower()).path
+                        looks_like_media = is_manifest or any(src_path.endswith(e) for e in VIDEO_EXTENSIONS)
+                        if not looks_like_media:
+                            continue   # iframe / embed page URLs are not downloadable streams
+                        found_videos.append({"url": src, "content_type": "dom-extracted", "size": 0,
+                                             "is_ad": is_ad, "is_segment": is_segment,
+                                             "is_manifest": is_manifest, "t": time.time() - t_start})
+                        log(f"   🎯 DOM source: {src[:80]}...")
+                        seen_urls.add(src)
+            except Exception:
+                pass
+
+            # Extra wait if nothing found
+            if not found_videos:
+                log("   ⏳ Extended wait for lazy-loaded content...")
+                page.wait_for_timeout(8000)
+
+            log(f"   (capture finished in {time.time() - t_start:.0f}s, closing browser)")
+            try:
+                session_cookies = context.cookies()
+            except Exception:
+                session_cookies = []
+            try:
+                context.close()
+                browser.close()
+            except Exception:
+                pass
+
+        # Probe how long each non-ad manifest actually is. A 15s playlist is
+        # an ad even if it came from an unknown host; a 20-minute one is the show.
+        probed = 0
+        for v in found_videos:
+            if v["is_manifest"] and not v["is_ad"] and not v.get("duration") and probed < 6:
+                probed += 1
+                d, v["is_master"] = probe_stream_duration(v["url"], referer=page_url)
+                if d:
+                    v["duration"] = d
+                    flag = "" if d >= 45 else "  (ad-length, skipping)"
+                    log(f"   ⏱ {d/60:.1f} min  ←  {urlparse(v['url']).netloc}{flag}")
+
+        for v in found_videos:
+            v["page_title"] = page_title
+            v["cookies"] = session_cookies
+        if session_cookies:
+            log(f"   🍪 {len(session_cookies)} session cookie(s) captured for the download")
+        return found_videos
+
+
+# ══════════════════════════════════════════════════════════════
+#  ENGINE 3: DIRECT HTML SCRAPER
+# ══════════════════════════════════════════════════════════════
+class DirectScraper:
+    """
+    Fetches raw page HTML and uses regex to find video URLs.
+    Fast but won't work for JS-rendered content.
+    """
+
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+    }
+
+    VIDEO_PATTERNS = [
+        r'(https?://[^\s\'"<>]+\.(?:mp4|webm|m3u8|mpd|flv|mov|m4v)(?:\?[^\s\'"<>]*)?)',
+        r'"(?:file|src|source|url|video_url|stream_url|hls|dash|mp4|playback_url|content_url)":\s*"(https?://[^\s"]+)"',
+        r'<(?:source|video)[^>]+src=["\']?(https?://[^\s"\'<>]+)["\']?',
+        r'<meta[^>]+(?:property|name)=["\']og:video(?::url)?["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']og:video(?::url)?["\']',
+    ]
+
+    @staticmethod
+    def find_video_urls(page_url, log_callback=None):
+        found = []
+        seen = set()
+
+        def log(msg):
+            if log_callback:
+                log_callback(msg)
+
+        log("   Fetching page HTML...")
+        try:
+            resp = requests.get(page_url, headers=DirectScraper.HEADERS, timeout=15, allow_redirects=True)
+            html = resp.text
+            log(f"   Got {len(html):,} chars")
+
+            for pattern in DirectScraper.VIDEO_PATTERNS:
+                for match in re.finditer(pattern, html, re.IGNORECASE):
+                    url = match.group(1) if match.lastindex else match.group(0)
+                    url = url.strip().rstrip("\\")
+                    if url not in seen and url.startswith("http"):
+                        seen.add(url)
+                        found.append({"url": url, "content_type": "scraped", "size": 0})
+                        log(f"   🎯 Found: {url[:80]}...")
+
+        except Exception as e:
+            log(f"   ❌ Scraping failed: {e}")
+
+        return found
+
+
+# ══════════════════════════════════════════════════════════════
+#  DIRECT FILE DOWNLOADER (for Engine 2 & 3 results)
+# ══════════════════════════════════════════════════════════════
+class FileDownloader:
+    """Downloads a direct video URL to disk with progress."""
+
+    @staticmethod
+    def download(video_url, save_dir, log_callback=None, progress_callback=None,
+                 referer=None, extra_headers=None):
+        def log(msg):
+            if log_callback:
+                log_callback(msg)
+
+        headers = {
+            "User-Agent": BROWSER_UA,
+            "Referer": referer or video_url,
+        }
+        headers.update(extra_headers or {})
+
+        log(f"   ⬇ Downloading stream...")
+        resp = requests.get(video_url, headers=headers, stream=True, timeout=30)
+        resp.raise_for_status()
+
+        total = int(resp.headers.get("content-length", 0))
+        content_type = resp.headers.get("content-type", "")
+
+        parsed = urlparse(video_url)
+        path_ext = Path(parsed.path).suffix.lower()
+        if path_ext in VIDEO_EXTENSIONS:
+            ext = path_ext
+        elif "mp4" in content_type:
+            ext = ".mp4"
+        elif "webm" in content_type:
+            ext = ".webm"
+        else:
+            ext = ".mp4"
+
+        filename = f"video_{int(time.time())}{ext}"
+        filepath = os.path.join(save_dir, filename)
+
+        downloaded = 0
+        with open(filepath, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=1024 * 256):
+                if chunk:
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if progress_callback and total > 0:
+                        progress_callback(downloaded, total)
+
+        size_mb = os.path.getsize(filepath) / 1024 / 1024
+        log(f"   ✅ Saved: {filename} ({size_mb:.1f} MB)")
+        return filepath
+
+    @staticmethod
+    def download_m3u8(m3u8_url, save_dir, log_callback=None, referer=None, extra_headers=None):
+        """Use ffmpeg to download HLS/DASH streams."""
+        def log(msg):
+            if log_callback:
+                log_callback(msg)
+
+        if not shutil.which("ffmpeg"):
+            raise RuntimeError("ffmpeg required for HLS streams. Please install it.")
+
+        filename = f"video_{int(time.time())}.mp4"
+        filepath = os.path.join(save_dir, filename)
+
+        log(f"   ⬇ Downloading HLS stream via ffmpeg...")
+        cmd = [
+            "ffmpeg", "-y",
+            "-user_agent", BROWSER_UA,
+            "-headers", "".join(f"{k}: {v}\r\n" for k, v in
+                                {"Referer": referer or m3u8_url, **(extra_headers or {})}.items()),
+            "-i", m3u8_url,
+            "-c", "copy",
+            "-bsf:a", "aac_adtstoasc",
+            filepath
+        ]
+
+        process = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if process.returncode != 0:
+            raise RuntimeError(f"ffmpeg error: {process.stderr[-200:]}")
+
+        size_mb = os.path.getsize(filepath) / 1024 / 1024
+        log(f"   ✅ Saved: {filename} ({size_mb:.1f} MB)")
+        return filepath
+
+
+def safe_filename(name, fallback):
+    name = re.sub(r'[\\/:*?"<>|\r\n]+', " ", name or "").strip(" .")
+    name = re.sub(r"\s+", " ", name)
+    return name[:120] or fallback
+
+
+class DownloadJob:
+    """One URL in the queue, with its own progress state and UI row."""
+
+    def __init__(self, idx, url):
+        self.idx = idx
+        self.url = url
+        self.title = ""
+        self.status = "queued"      # queued | working | done | failed
+        self.engine = ""
+        self.pct = 0.0
+        self.detail = ""
+        self.error = ""
+        self.last_ui = 0.0
+        # widgets, filled in by the app
+        self.row = self.label = self.pct_label = self.bar = self.detail_label = None
+
+    @property
+    def display_name(self):
+        return self.title or self.url[:70]
+
+
+# ══════════════════════════════════════════════════════════════
+#  MAIN APPLICATION
+# ══════════════════════════════════════════════════════════════
+class VideoDownloaderApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        self.title("Stellar Downloader v3")
+        self.geometry("760x900")
+        self.minsize(660, 820)
+        self.configure(fg_color=COLORS["bg_dark"])
+        ctk.set_appearance_mode("dark")
+
+        self.download_path = str(Path.home() / "Downloads")
+        self.is_downloading = False
+        self.current_format = "best_video"
+        self.max_parallel = 3
+        self.jobs = []                      # every job ever added (rows in the panel)
+        self._pending = []                  # jobs waiting for a free slot
+        self._active = 0                    # jobs currently running
+        self._sched_lock = threading.Lock()
+        self._next_idx = 1
+        self.cookie_browser = "None"
+        self.playwright_available = BrowserInterceptor.is_available()
+
+        self._build_ui()
+
+    def _build_ui(self):
+        # ── Scrollable container ──────────────────────────
+        self.main_frame = ctk.CTkScrollableFrame(
+            self, fg_color="transparent",
+            scrollbar_button_color=COLORS["border"],
+            scrollbar_button_hover_color=COLORS["text_muted"]
+        )
+        self.main_frame.pack(fill="both", expand=True, padx=0, pady=0)
+        container = self.main_frame
+
+        # ── Header ─────────────────────────────────────────
+        header = ctk.CTkFrame(container, fg_color="transparent")
+        header.pack(fill="x", padx=28, pady=(24, 0))
+
+        title_row = ctk.CTkFrame(header, fg_color="transparent")
+        title_row.pack(fill="x")
+
+        ctk.CTkLabel(title_row, text="⬡", font=(FONT, 30, "bold"),
+                     text_color=COLORS["accent"]).pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(title_row, text="Stellar", font=(FONT, 28, "bold"),
+                     text_color=COLORS["text_primary"]).pack(side="left")
+        ctk.CTkLabel(title_row, text="Downloader", font=(FONT, 28),
+                     text_color=COLORS["text_secondary"]).pack(side="left", padx=(8, 0))
+        ctk.CTkLabel(title_row, text="v3", font=(FONT, 14, "bold"),
+                     text_color=COLORS["accent"],
+                     fg_color=COLORS["accent_dim"],
+                     corner_radius=6, width=32, height=22
+                     ).pack(side="left", padx=(10, 0), pady=(2, 0))
+
+        ctk.CTkLabel(header, text="Multi-engine · works even when yt-dlp extractors are broken",
+                     font=(FONT, 12), text_color=COLORS["text_muted"]
+                     ).pack(anchor="w", pady=(4, 0))
+
+        # ── Engine Status Bar ─────────────────────────────
+        engine_bar = ctk.CTkFrame(container, fg_color=COLORS["bg_card"], corner_radius=12,
+                                  border_width=1, border_color=COLORS["border"])
+        engine_bar.pack(fill="x", padx=28, pady=(16, 0))
+
+        ebar_inner = ctk.CTkFrame(engine_bar, fg_color="transparent")
+        ebar_inner.pack(fill="x", padx=16, pady=12)
+        ebar_inner.columnconfigure((0, 1, 2), weight=1)
+
+        engines_info = [
+            ("engine1", "⚡ Engine 1", "yt-dlp", "✓ Ready"),
+            ("engine2", "🌐 Engine 2", "Browser", "✓ Ready" if self.playwright_available else "○ Install"),
+            ("engine3", "📄 Engine 3", "Scraper", "✓ Ready"),
+        ]
+        for i, (color_key, label, sublabel, status) in enumerate(engines_info):
+            ef = ctk.CTkFrame(ebar_inner, fg_color="transparent")
+            ef.grid(row=0, column=i, padx=4, sticky="ew")
+            ctk.CTkLabel(ef, text=label, font=(FONT, 12, "bold"),
+                         text_color=COLORS[color_key]).pack(anchor="w")
+            ctk.CTkLabel(ef, text=f"{sublabel} — {status}", font=(FONT, 10),
+                         text_color=COLORS["text_muted"]).pack(anchor="w")
+
+        # ── Divider ───────────────────────────────────────
+        ctk.CTkFrame(container, height=1, fg_color=COLORS["border"]
+                     ).pack(fill="x", padx=28, pady=(16, 0))
+
+        # ── URL Input ─────────────────────────────────────
+        url_card = ctk.CTkFrame(container, fg_color=COLORS["bg_card"], corner_radius=14,
+                                border_width=1, border_color=COLORS["border"])
+        url_card.pack(fill="x", padx=28, pady=(16, 0))
+
+        url_top = ctk.CTkFrame(url_card, fg_color="transparent")
+        url_top.pack(fill="x", padx=18, pady=(14, 6))
+        ctk.CTkLabel(url_top, text="🔗  PASTE VIDEO URLS  (one per line)",
+                     font=(FONT, 11, "bold"), text_color=COLORS["text_muted"]
+                     ).pack(side="left")
+
+        ctk.CTkLabel(url_top, text="at once:", font=(FONT, 11),
+                     text_color=COLORS["text_muted"]).pack(side="left", padx=(16, 4))
+        self.parallel_menu = ctk.CTkOptionMenu(
+            url_top, values=["1", "2", "3", "4", "5"], width=58, height=26,
+            font=(FONT, 11, "bold"), fg_color=COLORS["bg_input"],
+            button_color=COLORS["accent_dim"], button_hover_color=COLORS["accent"],
+            dropdown_fg_color=COLORS["bg_card"], text_color=COLORS["text_primary"],
+            command=lambda v: setattr(self, "max_parallel", int(v))
+        )
+        self.parallel_menu.set(str(self.max_parallel))
+        self.parallel_menu.pack(side="left")
+
+        ctk.CTkButton(
+            url_top, text="🗑 Clear", font=(FONT, 11), width=64, height=26,
+            fg_color=COLORS["bg_input"], hover_color=COLORS["card_hover"],
+            border_width=1, border_color=COLORS["border"], corner_radius=8,
+            text_color=COLORS["text_secondary"],
+            command=lambda: self.url_box.delete("1.0", "end")
+        ).pack(side="right")
+        ctk.CTkButton(
+            url_top, text="📋 Paste", font=(FONT, 11), width=70, height=26,
+            fg_color=COLORS["bg_input"], hover_color=COLORS["card_hover"],
+            border_width=1, border_color=COLORS["border"], corner_radius=8,
+            text_color=COLORS["text_secondary"], command=self._paste_url
+        ).pack(side="right", padx=(0, 6))
+
+        self.url_box = ctk.CTkTextbox(
+            url_card, font=(FONT, 13), height=96, fg_color=COLORS["bg_input"],
+            border_color=COLORS["border"], border_width=1, corner_radius=10,
+            text_color=COLORS["text_primary"], wrap="none"
+        )
+        self.url_box.pack(fill="x", padx=18, pady=(0, 14))
+
+        # ── Format Selection ──────────────────────────────
+        fmt_card = ctk.CTkFrame(container, fg_color=COLORS["bg_card"], corner_radius=14,
+                                border_width=1, border_color=COLORS["border"])
+        fmt_card.pack(fill="x", padx=28, pady=(12, 0))
+
+        ctk.CTkLabel(fmt_card, text="📦  FORMAT",
+                     font=(FONT, 11, "bold"), text_color=COLORS["text_muted"]
+                     ).pack(anchor="w", padx=18, pady=(14, 8))
+
+        fmt_frame = ctk.CTkFrame(fmt_card, fg_color="transparent")
+        fmt_frame.pack(fill="x", padx=18, pady=(0, 14))
+        fmt_frame.columnconfigure((0, 1, 2, 3), weight=1)
+
+        self.format_buttons = {}
+        formats = [
+            ("best_video", "🎬 Best"),
+            ("mp4_1080",   "📺 1080p"),
+            ("mp4_720",    "📱 720p"),
+            ("mp3",        "🎵 MP3"),
+        ]
+        for i, (key, label) in enumerate(formats):
+            btn = ctk.CTkButton(
+                fmt_frame, text=label, font=(FONT, 12, "bold"), height=42,
+                fg_color=COLORS["accent"] if key == self.current_format else COLORS["bg_input"],
+                hover_color=COLORS["accent_hover"] if key == self.current_format else COLORS["card_hover"],
+                border_width=1,
+                border_color=COLORS["accent"] if key == self.current_format else COLORS["border"],
+                corner_radius=10, text_color=COLORS["text_primary"],
+                command=lambda k=key: self._select_format(k)
+            )
+            btn.grid(row=0, column=i, padx=3, sticky="ew")
+            self.format_buttons[key] = btn
+
+        # ── Settings Card ─────────────────────────────────
+        adv_card = ctk.CTkFrame(container, fg_color=COLORS["bg_card"], corner_radius=14,
+                                border_width=1, border_color=COLORS["border"])
+        adv_card.pack(fill="x", padx=28, pady=(12, 0))
+
+        ctk.CTkLabel(adv_card, text="⚙  SETTINGS",
+                     font=(FONT, 11, "bold"), text_color=COLORS["text_muted"]
+                     ).pack(anchor="w", padx=18, pady=(14, 8))
+
+        settings_frame = ctk.CTkFrame(adv_card, fg_color="transparent")
+        settings_frame.pack(fill="x", padx=18, pady=(0, 14))
+
+        # Row 1: Save location
+        row1 = ctk.CTkFrame(settings_frame, fg_color="transparent")
+        row1.pack(fill="x", pady=(0, 8))
+
+        ctk.CTkLabel(row1, text="📁", font=(FONT, 14)).pack(side="left", padx=(0, 6))
+        self.path_label = ctk.CTkLabel(
+            row1, text=self._truncate_path(self.download_path),
+            font=(FONT, 12), text_color=COLORS["text_secondary"], anchor="w"
+        )
+        self.path_label.pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(
+            row1, text="Change", font=(FONT, 11), width=70, height=30,
+            fg_color=COLORS["bg_input"], hover_color=COLORS["card_hover"],
+            border_width=1, border_color=COLORS["border"], corner_radius=8,
+            text_color=COLORS["text_secondary"], command=self._choose_folder
+        ).pack(side="right")
+
+        # Row 2: Cookies + Install Playwright + Update
+        row2 = ctk.CTkFrame(settings_frame, fg_color="transparent")
+        row2.pack(fill="x")
+
+        ctk.CTkLabel(row2, text="🍪", font=(FONT, 14)).pack(side="left", padx=(0, 4))
+        self.cookie_dropdown = ctk.CTkOptionMenu(
+            row2, values=["None", "Chrome", "Firefox", "Edge", "Brave", "Opera", "Safari"],
+            font=(FONT, 11), width=100, height=30,
+            fg_color=COLORS["bg_input"], button_color=COLORS["border"],
+            button_hover_color=COLORS["card_hover"],
+            dropdown_fg_color=COLORS["bg_card"], dropdown_hover_color=COLORS["card_hover"],
+            dropdown_text_color=COLORS["text_primary"], text_color=COLORS["text_primary"],
+            corner_radius=8, command=lambda v: setattr(self, "cookie_browser", v)
+        )
+        self.cookie_dropdown.set("None")
+        self.cookie_dropdown.pack(side="left", padx=(0, 8))
+
+        self.install_pw_btn = ctk.CTkButton(
+            row2, text="✅ Browser" if self.playwright_available else "🌐 Install Browser",
+            font=(FONT, 11, "bold"), height=30,
+            fg_color=COLORS["bg_input"],
+            hover_color=COLORS["card_hover"], corner_radius=8,
+            text_color=COLORS["success"] if self.playwright_available else COLORS["engine2"],
+            command=self._install_playwright
+        )
+        self.install_pw_btn.pack(side="left", padx=(0, 8))
+
+        ctk.CTkButton(
+            row2, text="🔄 Update yt-dlp", font=(FONT, 11, "bold"), width=110, height=30,
+            fg_color=COLORS["bg_input"], hover_color=COLORS["card_hover"],
+            border_width=1, border_color=COLORS["border"], corner_radius=8,
+            text_color=COLORS["warning"], command=self._update_ytdlp
+        ).pack(side="right")
+
+        # ── Download Button ───────────────────────────────
+        self.download_btn = ctk.CTkButton(
+            container, text="⬇  ADD & DOWNLOAD", font=(FONT, 16, "bold"),
+            height=54, fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"],
+            corner_radius=12, text_color="#FFFFFF", command=self._start_download
+        )
+        self.download_btn.pack(fill="x", padx=28, pady=(16, 0))
+
+        # ── Queue ─────────────────────────────────────────
+        queue_card = ctk.CTkFrame(container, fg_color=COLORS["bg_card"], corner_radius=14,
+                                  border_width=1, border_color=COLORS["border"])
+        queue_card.pack(fill="x", padx=28, pady=(12, 0))
+        q_top = ctk.CTkFrame(queue_card, fg_color="transparent")
+        q_top.pack(fill="x", padx=18, pady=(12, 4))
+        ctk.CTkLabel(q_top, text="📋  QUEUE",
+                     font=(FONT, 11, "bold"), text_color=COLORS["text_muted"]
+                     ).pack(side="left")
+        self.queue_count_label = ctk.CTkLabel(q_top, text="", font=(FONT, 11),
+                                              text_color=COLORS["text_muted"])
+        self.queue_count_label.pack(side="left", padx=(10, 0))
+        ctk.CTkButton(
+            q_top, text="🧹 Clear finished", font=(FONT, 11), width=110, height=24,
+            fg_color=COLORS["bg_input"], hover_color=COLORS["card_hover"],
+            border_width=1, border_color=COLORS["border"], corner_radius=8,
+            text_color=COLORS["text_secondary"], command=self._clear_finished
+        ).pack(side="right")
+        self.queue_frame = ctk.CTkScrollableFrame(
+            queue_card, fg_color="transparent", height=150,
+            scrollbar_button_color=COLORS["border"],
+            scrollbar_button_hover_color=COLORS["text_muted"]
+        )
+        self.queue_frame.pack(fill="x", padx=12, pady=(0, 10))
+        self.queue_empty_label = ctk.CTkLabel(
+            self.queue_frame, text="Nothing queued yet", font=(FONT, 11),
+            text_color=COLORS["text_muted"])
+        self.queue_empty_label.pack(pady=20)
+
+        # ── Progress ──────────────────────────────────────
+        prog_card = ctk.CTkFrame(container, fg_color=COLORS["bg_card"], corner_radius=14,
+                                 border_width=1, border_color=COLORS["border"])
+        prog_card.pack(fill="x", padx=28, pady=(12, 0))
+
+        prog_top = ctk.CTkFrame(prog_card, fg_color="transparent")
+        prog_top.pack(fill="x", padx=18, pady=(14, 6))
+
+        self.status_dot = ctk.CTkLabel(prog_top, text="●", font=(FONT, 10),
+                                       text_color=COLORS["text_muted"])
+        self.status_dot.pack(side="left", padx=(0, 6))
+
+        self.status_label = ctk.CTkLabel(
+            prog_top, text="Ready — paste one or more URLs and hit download",
+            font=(FONT, 12), text_color=COLORS["text_secondary"], anchor="w"
+        )
+        self.status_label.pack(side="left", fill="x", expand=True)
+
+        self.percent_label = ctk.CTkLabel(prog_top, text="", font=(FONT, 12, "bold"),
+                                          text_color=COLORS["accent"])
+        self.percent_label.pack(side="right")
+
+        self.progress_bar = ctk.CTkProgressBar(
+            prog_card, height=6, corner_radius=3,
+            fg_color=COLORS["progress_bg"], progress_color=COLORS["accent"]
+        )
+        self.progress_bar.pack(fill="x", padx=18, pady=(0, 4))
+        self.progress_bar.set(0)
+
+        self.detail_label = ctk.CTkLabel(prog_card, text="", font=(FONT, 11),
+                                         text_color=COLORS["text_muted"], anchor="w")
+        self.detail_label.pack(anchor="w", padx=18, pady=(0, 12))
+
+        # ── Log ───────────────────────────────────────────
+        log_card = ctk.CTkFrame(container, fg_color=COLORS["bg_card"], corner_radius=14,
+                                border_width=1, border_color=COLORS["border"])
+        log_card.pack(fill="both", expand=True, padx=28, pady=(12, 20))
+
+        ctk.CTkLabel(log_card, text="📝  ENGINE LOG",
+                     font=(FONT, 11, "bold"), text_color=COLORS["text_muted"]
+                     ).pack(anchor="w", padx=18, pady=(12, 4))
+
+        self.log_box = ctk.CTkTextbox(
+            log_card, font=("Consolas", 11), fg_color=COLORS["bg_input"],
+            text_color=COLORS["text_muted"], corner_radius=8,
+            border_width=1, border_color=COLORS["border"], wrap="word", height=160
+        )
+        self.log_box.pack(fill="both", expand=True, padx=18, pady=(0, 12))
+
+    # ══════════════════════════════════════════════════════
+    #  UI HELPERS
+    # ══════════════════════════════════════════════════════
+    def _paste_url(self):
+        try:
+            text = self.clipboard_get().strip()
+            if not text:
+                return
+            existing = self.url_box.get("1.0", "end").strip()
+            if existing and not existing.endswith("\n"):
+                self.url_box.insert("end", "\n")
+            self.url_box.insert("end", text + "\n")
+            self.url_box.see("end")
+        except Exception:
+            pass
+
+    def _parse_urls(self):
+        """URLs from the box: one per line (whitespace-separated also OK), de-duplicated."""
+        raw = self.url_box.get("1.0", "end")
+        urls, seen = [], set()
+        for token in re.split(r"[\s,]+", raw):
+            token = token.strip().strip('"\'<>')
+            if not token:
+                continue
+            if not re.match(r"^https?://", token, re.I):
+                if "." not in token:
+                    continue
+                token = "https://" + token
+            if token not in seen:
+                seen.add(token)
+                urls.append(token)
+        return urls
+
+    # ── per-job UI ────────────────────────────────────────
+    def _build_job_rows(self, jobs):
+        if self.queue_empty_label is not None:
+            self.queue_empty_label.destroy()
+            self.queue_empty_label = None
+        for job in jobs:
+            row = ctk.CTkFrame(self.queue_frame, fg_color=COLORS["bg_input"], corner_radius=8)
+            job.row = row
+            row.pack(fill="x", pady=3, padx=2)
+            top = ctk.CTkFrame(row, fg_color="transparent")
+            top.pack(fill="x", padx=10, pady=(6, 2))
+            job.label = ctk.CTkLabel(top, text=f"⏸ #{job.idx}  {job.display_name}",
+                                     font=(FONT, 11, "bold"), anchor="w",
+                                     text_color=COLORS["text_secondary"])
+            job.label.pack(side="left", fill="x", expand=True)
+            job.pct_label = ctk.CTkLabel(top, text="", font=(FONT, 11, "bold"),
+                                         text_color=COLORS["accent"])
+            job.pct_label.pack(side="right")
+            job.bar = ctk.CTkProgressBar(row, height=4, corner_radius=2,
+                                         fg_color=COLORS["progress_bg"],
+                                         progress_color=COLORS["accent"])
+            job.bar.pack(fill="x", padx=10)
+            job.bar.set(0)
+            job.detail_label = ctk.CTkLabel(row, text="queued", font=(FONT, 10),
+                                            text_color=COLORS["text_muted"], anchor="w")
+            job.detail_label.pack(fill="x", padx=10, pady=(0, 6))
+
+    def _clear_finished(self):
+        keep = []
+        for job in self.jobs:
+            if job.status in ("done", "failed") and job.row is not None:
+                job.row.destroy()
+                job.row = job.label = None
+            else:
+                keep.append(job)
+        self.jobs = keep
+        if not self.jobs:
+            self.queue_empty_label = ctk.CTkLabel(
+                self.queue_frame, text="Nothing queued yet", font=(FONT, 11),
+                text_color=COLORS["text_muted"])
+            self.queue_empty_label.pack(pady=20)
+            self.progress_bar.set(0)
+            self.percent_label.configure(text="")
+        self._refresh_overall()
+
+    def _refresh_job_row(self, job):
+        if not job.label:
+            return
+        icon = {"queued": "⏸", "working": "⏳", "done": "✅", "failed": "❌"}[job.status]
+        color = {"queued": COLORS["text_secondary"], "working": COLORS["text_primary"],
+                 "done": COLORS["success"], "failed": COLORS["error"]}[job.status]
+        job.label.configure(text=f"{icon} #{job.idx}  {job.display_name}", text_color=color)
+        job.bar.set(job.pct)
+        job.bar.configure(progress_color=COLORS["success"] if job.status == "done"
+                          else COLORS["error"] if job.status == "failed" else COLORS["accent"])
+        job.pct_label.configure(text=f"{job.pct*100:.0f}%" if job.status in ("working", "done") else "")
+        detail = job.error if job.status == "failed" else job.detail
+        if job.engine and job.status == "working":
+            detail = f"{job.engine}  ·  {detail}" if detail else job.engine
+        job.detail_label.configure(text=detail[:110])
+
+    def _job_update(self, job, *, status=None, engine=None, detail=None, pct=None,
+                    title=None, error=None, force=True):
+        """Thread-safe update of a job's state + row (rate-limited for progress spam)."""
+        if status is not None:
+            job.status = status
+        if engine is not None:
+            job.engine = engine
+        if detail is not None:
+            job.detail = detail
+        if pct is not None:
+            job.pct = max(0.0, min(1.0, pct))
+        if title is not None:
+            job.title = title
+        if error is not None:
+            job.error = error
+        now = time.time()
+        if not force and now - job.last_ui < 0.25:
+            return
+        job.last_ui = now
+        self.after(0, lambda: self._refresh_job_row(job))
+        self.after(0, self._refresh_overall)
+
+    def _jlog(self, job, msg):
+        """Log line tagged with the job number (safe from worker threads)."""
+        tag = f"[#{job.idx}] " if len(self.jobs) > 1 else ""
+        self._log_safe(f"{tag}{msg}")
+
+    def _refresh_overall(self):
+        if not self.jobs:
+            return
+        total = len(self.jobs)
+        done = sum(1 for j in self.jobs if j.status == "done")
+        failed = sum(1 for j in self.jobs if j.status == "failed")
+        working = [j for j in self.jobs if j.status == "working"]
+        overall = sum(1.0 if j.status == "done" else j.pct if j.status == "working" else 0
+                      for j in self.jobs) / total
+        queued = total - done - failed - len(working)
+        self.progress_bar.set(overall)
+        self.percent_label.configure(text=f"{done + failed}/{total}")
+        self.queue_count_label.configure(
+            text=f"{len(working)} running · {queued} waiting · {done} done" + (f" · {failed} failed" if failed else ""))
+        if self.is_downloading:
+            parts = [f"Downloading {len(working)}"]
+            if queued:
+                parts.append(f"{queued} waiting")
+            if done:
+                parts.append(f"{done} done")
+            if failed:
+                parts.append(f"{failed} failed")
+            self._set_status("  ·  ".join(parts), COLORS["engine1"])
+            self.detail_label.configure(text="   •   ".join(
+                f"#{j.idx} {j.pct*100:.0f}%" for j in working)[:120])
+
+    def _select_format(self, fmt):
+        self.current_format = fmt
+        for key, btn in self.format_buttons.items():
+            if key == fmt:
+                btn.configure(fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"],
+                              border_color=COLORS["accent"])
+            else:
+                btn.configure(fg_color=COLORS["bg_input"], hover_color=COLORS["card_hover"],
+                              border_color=COLORS["border"])
+
+    def _choose_folder(self):
+        from tkinter import filedialog
+        folder = filedialog.askdirectory(initialdir=self.download_path)
+        if folder:
+            self.download_path = folder
+            self.path_label.configure(text=self._truncate_path(folder))
+
+    def _truncate_path(self, path, max_len=45):
+        return path if len(path) <= max_len else "..." + path[-(max_len - 3):]
+
+    def _log(self, msg):
+        self.log_box.insert("end", msg + "\n")
+        self.log_box.see("end")
+
+    def _log_safe(self, msg):
+        self.after(0, lambda: self._log(msg))
+
+    def _set_status(self, text, color=None):
+        self.status_label.configure(text=text)
+        if color:
+            self.status_dot.configure(text_color=color)
+
+    def _format_bytes(self, b):
+        if not b:
+            return "?"
+        for unit in ["B", "KB", "MB", "GB"]:
+            if b < 1024:
+                return f"{b:.1f} {unit}"
+            b /= 1024
+        return f"{b:.1f} TB"
+
+    # ══════════════════════════════════════════════════════
+    #  INSTALL / UPDATE
+    # ══════════════════════════════════════════════════════
+    def _install_playwright(self):
+        if self.playwright_available:
+            self._log("✅ Browser engine already installed!")
+            return
+
+        self.install_pw_btn.configure(text="⏳ Installing...", state="disabled")
+        self._log("📦 Installing Playwright + Chromium...")
+
+        def _do():
+            try:
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "playwright"])
+                subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
+                self.playwright_available = True
+                self.after(0, lambda: self._log("✅ Browser engine installed successfully!"))
+                self.after(0, lambda: self.install_pw_btn.configure(
+                    text="✅ Browser", state="normal", text_color=COLORS["success"]))
+            except Exception as e:
+                self.after(0, lambda: self._log(f"❌ Install failed: {e}"))
+                self.after(0, lambda: self.install_pw_btn.configure(
+                    text="🌐 Install Browser", state="normal"))
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _update_ytdlp(self):
+        self._log("🔄 Updating yt-dlp to latest version...")
+
+        def _do():
+            try:
+                r = subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp[default,curl-cffi]"],
+                                   capture_output=True, text=True)
+                if r.returncode == 0:
+                    self.after(0, lambda: self._log("✅ yt-dlp updated! Restart app for full effect."))
+                else:
+                    self.after(0, lambda: self._log(f"❌ {r.stderr[:150]}"))
+            except Exception as e:
+                self.after(0, lambda: self._log(f"❌ {e}"))
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    # ══════════════════════════════════════════════════════
+    #  YT-DLP OPTIONS (Engine 1)
+    # ══════════════════════════════════════════════════════
+    def _get_ydl_opts(self, job=None):
+        opts = {
+            "outtmpl": os.path.join(self.download_path, "%(title).150B.%(ext)s"),
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,                   # the queue rows show progress instead
+            "progress_hooks": [lambda d, j=job: self._ydl_progress_hook(d, j)] if job else [],
+            "concurrent_fragment_downloads": 4,   # faster HLS/DASH downloads
+            "overwrites": False,
+            # Let the impersonated client supply User-Agent/Accept so they
+            # match the TLS fingerprint (Cloudflare checks both).
+            "http_headers": {
+                "Accept-Language": "en-US,en;q=0.5",
+                "Referer": "https://www.google.com/",
+            },
+            # Cloudflare anti-bot fingerprints the TLS handshake; the generic
+            # extractor only bypasses it when told to impersonate a browser
+            # (requires the curl_cffi backend: pip install "yt-dlp[curl-cffi]").
+            "extractor_args": {"generic": {"impersonate": ["chrome"]}},
+            "retries": 5,
+            "fragment_retries": 5,
+            "socket_timeout": 30,
+            "nocheckcertificate": True,
+            "geo_bypass": True,
+            "legacy_server_connect": True,
+        }
+
+        if self.cookie_browser and self.cookie_browser != "None":
+            opts["cookiesfrombrowser"] = (self.cookie_browser.lower(),)
+
+        fmt_map = {
+            "mp3":        ("bestaudio/best", None, [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]),
+            "mp4_720":    ("bestvideo[height<=720]+bestaudio/best[height<=720]/best", "mp4", None),
+            "mp4_1080":   ("bestvideo[height<=1080]+bestaudio/best[height<=1080]/best", "mp4", None),
+            "best_video": ("bestvideo+bestaudio/best", "mp4", None),
+        }
+        fmt, merge, pp = fmt_map.get(self.current_format, fmt_map["best_video"])
+        opts["format"] = fmt
+        if merge:
+            opts["merge_output_format"] = merge
+        if pp:
+            opts["postprocessors"] = pp
+        return opts
+
+    def _ydl_progress_hook(self, d, job):
+        if job is None:
+            return
+        if d["status"] == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            downloaded = d.get("downloaded_bytes", 0)
+            speed = d.get("speed")
+            eta = d.get("eta")
+            pct = downloaded / total if total > 0 else job.pct
+            parts = []
+            if total > 0:
+                parts.append(f"{self._format_bytes(downloaded)} / {self._format_bytes(total)}")
+            if speed:
+                parts.append(f"⚡ {self._format_bytes(speed)}/s")
+            if eta:
+                parts.append(f"⏱ {timedelta(seconds=int(eta))}")
+            self._job_update(job, pct=pct, detail="   •   ".join(parts), force=False)
+        elif d["status"] == "finished":
+            self._job_update(job, pct=1.0, detail="merging / finishing...")
+
+    # ══════════════════════════════════════════════════════
+    #  MASTER DOWNLOAD ORCHESTRATOR
+    # ══════════════════════════════════════════════════════
+    def _start_download(self):
+        """Add whatever is in the URL box to the queue and start it right away.
+        Works at any time, including while other downloads are running."""
+        urls = self._parse_urls()
+        if not urls:
+            self._set_status("⚠  Paste at least one URL first", COLORS["warning"])
+            return
+
+        busy = {j.url for j in self.jobs if j.status in ("queued", "working")}
+        new_jobs = []
+        for u in urls:
+            if u in busy:
+                continue
+            job = DownloadJob(self._next_idx, u)
+            self._next_idx += 1
+            new_jobs.append(job)
+        if not new_jobs:
+            self._set_status("⚠  Those URLs are already in the queue", COLORS["warning"])
+            return
+
+        self.jobs.extend(new_jobs)
+        self._build_job_rows(new_jobs)
+        self.url_box.delete("1.0", "end")
+
+        first_batch = not self.is_downloading
+        self.is_downloading = True
+        if first_batch and all(j.status in ("done", "failed") for j in self.jobs if j not in new_jobs):
+            self.detail_label.configure(text="")
+        self._log("━" * 52)
+        for job in new_jobs:
+            self._log(f"➕ #{job.idx} {job.url}")
+        self._log(f"📦 {self.current_format}  📁 {self.download_path}  ⚡ up to {self.max_parallel} at once")
+
+        with self._sched_lock:
+            self._pending.extend(new_jobs)
+        self._schedule()
+        self._refresh_overall()
+
+    def _schedule(self):
+        """Start pending jobs while there are free slots (honours the live
+        'at once' setting). Safe to call from any thread."""
+        to_start = []
+        with self._sched_lock:
+            while self._pending and self._active < self.max_parallel:
+                job = self._pending.pop(0)
+                self._active += 1
+                to_start.append(job)
+        for job in to_start:
+            threading.Thread(target=self._run_job, args=(job,),
+                             name=f"dl-{job.idx}", daemon=True).start()
+
+    def _run_job(self, job):
+        self._job_update(job, status="working", detail="starting engines...")
+        try:
+            ok = self._download_orchestrator(job)
+        except Exception as e:
+            ok = False
+            job.error = " ".join(str(e).split())[:150]
+        if ok:
+            self._job_update(job, status="done", pct=1.0, detail="saved to " + self.download_path)
+        else:
+            self._job_update(job, status="failed", error=job.error or "all engines failed")
+
+        with self._sched_lock:
+            self._active -= 1
+            idle = self._active == 0 and not self._pending
+        self._schedule()
+        if idle:
+            self.after(0, self._queue_finished)
+
+    def _download_orchestrator(self, job):
+        """
+        Tries engines in order for ONE job; returns True on success.
+          1. yt-dlp (fastest, best for supported sites)
+          2. Playwright browser (intercepts real video network traffic)
+          3. Direct HTML scraping (fast regex fallback)
+        """
+        url = job.url
+        log = lambda m: self._jlog(job, m)
+
+        # ── ENGINE 1: yt-dlp ──────────────────────────────
+        log("")
+        log("⚡ ━━━ ENGINE 1: yt-dlp ━━━━━━━━━━━━━━━━━━━━━━━")
+        self._job_update(job, engine="Engine 1: yt-dlp", detail="extracting...")
+
+        attempts = [("", {})]
+        if impersonate_target():
+            # 2nd try: browser TLS fingerprint on EVERY request (page + video data),
+            # not just the generic extractor's page fetch.
+            attempts.append((" (full browser impersonation)", {"impersonate": impersonate_target()}))
+        for label, extra in attempts:
+            try:
+                opts = dict(self._get_ydl_opts(job), **extra)
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    title = info.get("title", "Unknown")
+                    log(f"   ✓ Found: {title}{label}")
+                    self._job_update(job, title=title, detail="downloading...")
+                    ydl.download([url])
+                return True
+            except Exception as e:
+                job.error = " ".join(str(e).split())[:150]
+                log(f"   ✗ {job.error}")
+                if "403" not in job.error and "forbidden" not in job.error.lower():
+                    break   # not an access problem; impersonating again won't help
+
+        # ── ENGINE 2: Playwright ──────────────────────────
+        if self.playwright_available:
+            log("")
+            log("🌐 ━━━ ENGINE 2: Browser Intercept ━━━━━━━━━━━━")
+            self._job_update(job, engine="Engine 2: Browser", pct=0, detail="scanning page...")
+
+            try:
+                videos = BrowserInterceptor.find_video_urls(url, log_callback=log, timeout=45)
+
+                if videos:
+                    n_ads = sum(1 for v in videos if v.get("is_ad"))
+                    n_seg = sum(1 for v in videos if v.get("is_segment"))
+                    log(f"   ✓ {len(videos)} stream(s) captured "
+                        f"({n_ads} ad, {n_seg} chunks, {len(videos)-n_ads-n_seg} content)")
+                    best = self._pick_best_video(videos, log)
+                    log(f"   ▶ Best: {best['url'][:80]}...")
+                    if best.get("page_title"):
+                        self._job_update(job, title=best["page_title"])
+                    self._job_update(job, detail="downloading stream...")
+
+                    self._download_candidate(best, url, job)
+                    return True
+                else:
+                    log("   ✗ No video streams detected in browser")
+                    job.error = "no video streams detected in browser"
+            except Exception as e:
+                job.error = " ".join(str(e).split())[:150]
+                log(f"   ✗ {job.error}")
+        else:
+            log("")
+            log("🌐 ━━━ ENGINE 2: SKIPPED (not installed) ━━━━━━")
+            log("   💡 Click 'Install Browser' for full support")
+
+        # ── ENGINE 3: Direct Scraping ─────────────────────
+        log("")
+        log("📄 ━━━ ENGINE 3: Direct Scraper ━━━━━━━━━━━━━━━")
+        self._job_update(job, engine="Engine 3: Scraper", pct=0, detail="scanning source...")
+
+        try:
+            videos = DirectScraper.find_video_urls(url, log_callback=log)
+
+            if videos:
+                log(f"   ✓ {len(videos)} URL(s) found in source")
+                best = self._pick_best_video(videos, log)
+                log(f"   ▶ Trying: {best['url'][:80]}...")
+                self._job_update(job, detail="downloading...")
+
+                self._download_candidate(best, url, job)
+                return True
+            else:
+                log("   ✗ No video URLs in page source")
+                job.error = job.error or "no video URLs in page source"
+        except Exception as e:
+            job.error = " ".join(str(e).split())[:150]
+            log(f"   ✗ {job.error}")
+
+        return False
+
+    def _pick_best_video(self, videos, log=None):
+        """
+        Select the most likely *content* stream from the candidates.
+        Ads lose on every axis: known ad hosts, ad-length duration, small
+        size, and arriving first (pre-roll) before the real manifest.
+        """
+        def score(v):
+            url = v["url"].lower()
+            is_ad, is_segment, is_manifest = classify_stream_url(url)
+            is_ad = v.get("is_ad", is_ad)
+            is_segment = v.get("is_segment", is_segment)
+            s = 0.0
+            if is_ad:
+                s -= 1000
+            if is_segment:
+                s -= 500          # a lone chunk is never what the user wants
+            dur = v.get("duration", 0) or 0
+            if dur:
+                s += min(dur, 7200) / 10        # 10 min -> +60, 1 h -> +360
+                if dur < 45:
+                    s -= 150                    # pre-roll length
+            if is_manifest:
+                s += 40                         # real players use HLS/DASH
+            if v.get("is_master"):
+                s += 10                         # master playlist: lets yt-dlp choose quality
+            size = v.get("size", 0) or 0
+            if size:
+                s += min(size / 1_000_000, 500) / 5   # 100 MB -> +20
+                if size < 1_500_000 and not is_manifest:
+                    s -= 60                         # sub-1.5MB file: hover preview / bumper
+            if any(pat in url for pat in PREVIEW_PATTERNS):
+                s -= 80
+            if v.get("content_type") == "dom-extracted":
+                s += 15
+            if ".mp4" in url or ".webm" in url:
+                s += 5
+            return s
+
+        log = log or self._log_safe
+        ranked = sorted(videos, key=score, reverse=True)
+        best = ranked[0]
+        if len(ranked) > 1:
+            log(f"   🏆 Picked {urlparse(best['url']).netloc} "
+                f"(score {score(best):.0f}, {len(ranked)-1} other candidate(s))")
+        if best.get("is_ad"):
+            log("   ⚠ Only ad streams were captured; the real player may need login/cookies")
+        return best
+
+    def _download_candidate(self, best, page_url, job):
+        """
+        Download an intercepted stream URL. yt-dlp first (handles master
+        playlists, best-quality selection and A/V merging, with the page as
+        Referer); fall back to the raw downloaders if it refuses.
+        """
+        video_url = best["url"]
+        log = lambda m: self._jlog(job, m)
+        base = safe_filename(best.get("page_title") or job.title,
+                             f"video_{int(time.time())}_{job.idx}")
+
+        # Replay what the real browser sent: same Referer/Origin, same UA the
+        # cookies were issued to, and the session cookies themselves.
+        req = {k.lower(): v for k, v in (best.get("req_headers") or {}).items()}
+        headers = {"User-Agent": BROWSER_UA, "Referer": req.get("referer") or page_url}
+        if req.get("origin"):
+            headers["Origin"] = req["origin"]
+        cookies = best.get("cookies") or []
+        cookie_file = None
+        if cookies:
+            try:
+                import tempfile
+                cookie_file = write_cookie_jar(
+                    cookies, os.path.join(tempfile.gettempdir(), f"stellar_cookies_{job.idx}_{int(time.time())}.txt"))
+            except Exception:
+                cookie_file = None
+
+        try:
+            opts = self._get_ydl_opts(job)
+            opts["http_headers"] = dict(opts.get("http_headers", {}), **headers)
+            opts["outtmpl"] = os.path.join(self.download_path, base + ".%(ext)s")
+            if cookie_file:
+                opts["cookiefile"] = cookie_file
+                opts.pop("cookiesfrombrowser", None)
+            if impersonate_target():
+                opts["impersonate"] = impersonate_target()
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([video_url])
+            return
+        except Exception as e:
+            log(f"   ↪ yt-dlp couldn't take the stream ({' '.join(str(e).split())[:90]}), using raw downloader")
+        finally:
+            if cookie_file:
+                try:
+                    os.remove(cookie_file)
+                except Exception:
+                    pass
+
+        extra = dict(headers)
+        cookie_hdr = cookies_for_url(cookies, video_url)
+        if cookie_hdr:
+            extra["Cookie"] = cookie_hdr
+        if ".m3u8" in video_url.lower() or ".mpd" in video_url.lower() or best.get("is_manifest"):
+            FileDownloader.download_m3u8(video_url, self.download_path,
+                                         log_callback=log, referer=headers["Referer"], extra_headers=extra)
+        else:
+            FileDownloader.download(video_url, self.download_path,
+                                    log_callback=log,
+                                    progress_callback=self._direct_progress(job),
+                                    referer=headers["Referer"], extra_headers=extra)
+
+    def _direct_progress(self, job):
+        def cb(downloaded, total):
+            if total > 0:
+                self._job_update(job, pct=downloaded / total,
+                                 detail=f"{self._format_bytes(downloaded)} / {self._format_bytes(total)}",
+                                 force=False)
+        return cb
+
+    # ══════════════════════════════════════════════════════
+    #  COMPLETION
+    # ══════════════════════════════════════════════════════
+    def _queue_finished(self):
+        with self._sched_lock:
+            if self._active or self._pending:
+                return          # something was added in the meantime
+        self.is_downloading = False
+        total = len(self.jobs)
+        done = sum(1 for j in self.jobs if j.status == "done")
+        failed = sum(1 for j in self.jobs if j.status == "failed")
+        self.progress_bar.set(1.0 if failed == 0 else done / max(total, 1))
+        self.percent_label.configure(text=f"{done}/{total}")
+        self.detail_label.configure(text="")
+        self._log("━" * 52)
+        if failed == 0:
+            self._set_status(f"All {total} download(s) complete!", COLORS["success"])
+            self._log(f"✅ All {total} download(s) complete!")
+        else:
+            self._set_status(f"{done} done, {failed} failed", COLORS["error"] if done == 0 else COLORS["warning"])
+            self._log(f"⚠ {done} succeeded, {failed} failed:")
+            for j in self.jobs:
+                if j.status == "failed":
+                    self._log(f"   ❌ #{j.idx} {j.url[:70]}  —  {j.error}")
+            self._log("")
+            self._log("💡 For the failed ones try:")
+            self._log("  1. 🔄 Update yt-dlp")
+            self._log("  2. 🌐 Install Browser Engine (Engine 2)")
+            self._log("  3. 🍪 Set cookies to Chrome/Firefox")
+            self._log("  4. Check if the video plays in your browser")
+        self._log(f"📁 {self.download_path}")
+        self._reset_btn()
+
+    def _reset_btn(self):
+        self.download_btn.configure(
+            text="⬇  ADD & DOWNLOAD", fg_color=COLORS["accent"], state="normal"
+        )
+
+
+# ══════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    app = VideoDownloaderApp()
+    app.mainloop()
