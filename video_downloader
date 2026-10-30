@@ -135,6 +135,57 @@ def write_cookie_jar(cookies, path):
     return path
 
 
+def aria2c_opts():
+    """yt-dlp options that hand plain-file downloads to aria2c with 16
+    connections. Many CDNs cap a single connection far below the line speed;
+    splitting the file lifts that without touching quality. Empty if aria2c
+    is not installed (winget install aria2.aria2)."""
+    if not shutil.which("aria2c"):
+        return {}
+    return {
+        "external_downloader": {"default": "aria2c"},
+        "external_downloader_args": {
+            "aria2c": ["-k1M", "--max-connection-per-server=16", "--quiet=true"],
+        },
+    }
+
+
+def aria2_control_progress(part_path):
+    """
+    (downloaded_bytes, total_bytes) from aria2's <file>.aria2 control file.
+    aria2 writes pieces out of order, so the .part file's size is meaningless
+    for progress; the control file's bitfield of finished pieces is exact.
+    Returns None if the control file is missing or unreadable.
+    """
+    import struct
+    try:
+        with open(part_path + ".aria2", "rb") as f:
+            data = f.read()
+        pos = 0
+        _ver, _ext = struct.unpack_from(">HI", data, pos); pos += 6
+        (ih_len,) = struct.unpack_from(">I", data, pos); pos += 4 + ih_len
+        (piece_len,) = struct.unpack_from(">I", data, pos); pos += 4
+        total, _upload = struct.unpack_from(">QQ", data, pos); pos += 16
+        (bf_len,) = struct.unpack_from(">I", data, pos); pos += 4
+        bitfield = data[pos:pos + bf_len]; pos += bf_len
+        done_pieces = sum(bin(b).count("1") for b in bitfield)
+        n_pieces = (total + piece_len - 1) // piece_len if piece_len else 0
+        done = done_pieces * piece_len
+        if n_pieces and bitfield and (bitfield[(n_pieces - 1) // 8] >> (7 - (n_pieces - 1) % 8)) & 1:
+            done -= piece_len - (total - (n_pieces - 1) * piece_len)   # last piece is shorter
+        # partially downloaded (in-flight) pieces
+        (n_inflight,) = struct.unpack_from(">I", data, pos); pos += 4
+        for _ in range(n_inflight):
+            _idx, plen, pbf_len = struct.unpack_from(">III", data, pos)
+            pos += 12
+            pbf = data[pos:pos + pbf_len]; pos += pbf_len
+            # sub-piece bitfield: each bit = 16 KiB block
+            done += min(sum(bin(b).count("1") for b in pbf) * 16384, plen)
+        return min(done, total), total
+    except Exception:
+        return None
+
+
 def impersonate_target():
     """ImpersonateTarget for yt-dlp if curl_cffi is installed, else None."""
     try:
@@ -205,6 +256,137 @@ def probe_stream_duration(url, referer=None, timeout=8):
 
 
 # ══════════════════════════════════════════════════════════════
+#  DNS BYPASS: ISPs often "block" adult sites by making their DNS
+#  resolver answer NXDOMAIN. The site itself is reachable; only the
+#  name lookup is sabotaged. We resolve via DNS-over-HTTPS instead.
+# ══════════════════════════════════════════════════════════════
+import socket
+
+class DNSBypass:
+    DOH_URLS = ["https://1.1.1.1/dns-query", "https://8.8.8.8/resolve"]
+    _orig_getaddrinfo = socket.getaddrinfo
+    _cache = {}
+    _blocked = set()
+    doh_ok = False
+    installed = False
+
+    @classmethod
+    def doh_lookup(cls, host):
+        """A records for host via DNS-over-HTTPS (cached). [] if nothing."""
+        if host in cls._cache:
+            return cls._cache[host]
+        ips = []
+        for base in cls.DOH_URLS:
+            try:
+                from curl_cffi import requests as cr
+                j = cr.get(base, params={"name": host, "type": "A"},
+                           headers={"accept": "application/dns-json"}, timeout=8).json()
+            except ImportError:
+                import json, urllib.request
+                from urllib.parse import urlencode
+                req = urllib.request.Request(f"{base}?{urlencode({'name': host, 'type': 'A'})}",
+                                             headers={"accept": "application/dns-json"})
+                j = json.loads(urllib.request.urlopen(req, timeout=8).read())
+            except Exception:
+                continue
+            ips = [a["data"] for a in j.get("Answer", []) if a.get("type") == 1]
+            if ips:
+                break
+        cls._cache[host] = ips
+        return ips
+
+    @classmethod
+    def system_resolves(cls, host):
+        try:
+            cls._orig_getaddrinfo(host, 443)
+            return True
+        except Exception:
+            return False
+
+    @classmethod
+    def _patched_getaddrinfo(cls, host, port, family=0, type=0, proto=0, flags=0):
+        try:
+            return cls._orig_getaddrinfo(host, port, family, type, proto, flags)
+        except socket.gaierror:
+            ips = cls.doh_lookup(host) if isinstance(host, str) else []
+            if not ips:
+                raise
+            cls._blocked.add(host)
+            return [(socket.AF_INET, type or socket.SOCK_STREAM, proto or socket.IPPROTO_TCP, "", (ip, port))
+                    for ip in ips]
+
+    @classmethod
+    def install(cls):
+        """
+        Patch Python's resolver (urllib/requests/yt-dlp native downloader) to
+        fall back to DoH, and teach curl_cffi sessions (yt-dlp impersonation,
+        manifest probes) to switch themselves to DoH the moment a lookup fails.
+        Nothing changes for networks whose DNS works normally.
+        """
+        if cls.installed:
+            return
+        cls.installed = True
+        socket.getaddrinfo = cls._patched_getaddrinfo
+        try:
+            from curl_cffi import CurlOpt
+            import curl_cffi.requests.session as cs
+            _request = cs.Session.request
+
+            def request(self, method, url, *a, **k):
+                try:
+                    return _request(self, method, url, *a, **k)
+                except Exception as e:
+                    msg = str(e)
+                    unresolved = getattr(e, "code", None) == 6 or "Could not resolve host" in msg
+                    if not unresolved or self.curl_options.get(CurlOpt.DOH_URL):
+                        raise
+                    host = urlparse(url).hostname or ""
+                    if not cls.doh_lookup(host):
+                        raise
+                    cls._blocked.add(host)
+                    self.curl_options[CurlOpt.DOH_URL] = cls.DOH_URLS[0]   # this session now resolves via DoH
+                    return _request(self, method, url, *a, **k)
+            cs.Session.request = request
+            cls.doh_ok = True
+        except Exception:
+            cls.doh_ok = False
+
+    @classmethod
+    def chromium_rules(cls, page_url, log=None):
+        """--host-resolver-rules value mapping every blocked host on the page
+        (page host + hosts referenced in its HTML) to its real IP."""
+        host = urlparse(page_url).hostname or ""
+        hosts = {host} if host else set()
+        if host and not cls.system_resolves(host):
+            try:
+                from curl_cffi import requests as cr
+                html = cr.get(page_url, impersonate="chrome", timeout=12).text
+                hosts.update(h.lower() for h in re.findall(r"https?://([a-z0-9.-]+\.[a-z]{2,})", html, re.I))
+            except Exception:
+                pass
+        rules = []
+        for h in sorted(hosts):
+            if cls.system_resolves(h):
+                continue
+            ips = cls.doh_lookup(h)
+            if ips:
+                rules.append(f"MAP {h} {ips[0]}")
+        if rules and log:
+            log(f"   🚧 DNS block bypassed for {len(rules)} host(s) in the browser")
+        return ",".join(rules)
+
+
+DNSBypass.install()
+
+
+def strip_lang_prefix(url):
+    """https://site/es/path -> https://site/path (None if no 2-letter prefix).
+    Localised URLs often miss yt-dlp's site-specific extractor patterns."""
+    m = re.match(r"^(https?://[^/]+)/([a-z]{2}(?:-[a-z]{2})?)/(.+)$", url, re.I)
+    return f"{m.group(1)}/{m.group(3)}" if m else None
+
+
+# ══════════════════════════════════════════════════════════════
 #  ENGINE 2: PLAYWRIGHT BROWSER INTERCEPTOR
 # ══════════════════════════════════════════════════════════════
 class BrowserInterceptor:
@@ -244,16 +426,17 @@ class BrowserInterceptor:
                 log_callback(msg)
 
         log("   Launching headless Chromium...")
+        launch_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-web-security",
+        ]
+        rules = DNSBypass.chromium_rules(page_url, log)
+        if rules:
+            launch_args.append(f"--host-resolver-rules={rules}")
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-web-security",
-                ]
-            )
+            browser = p.chromium.launch(headless=True, args=launch_args)
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
                 viewport={"width": 1920, "height": 1080},
@@ -662,6 +845,8 @@ class VideoDownloaderApp(ctk.CTk):
         self.playwright_available = BrowserInterceptor.is_available()
 
         self._build_ui()
+        if not shutil.which("aria2c"):
+            self._log("💡 Faster downloads: install aria2  →  winget install aria2.aria2")
 
     def _build_ui(self):
         # ── Scrollable container ──────────────────────────
@@ -888,6 +1073,12 @@ class VideoDownloaderApp(ctk.CTk):
             border_width=1, border_color=COLORS["border"], corner_radius=8,
             text_color=COLORS["text_secondary"], command=self._clear_finished
         ).pack(side="right")
+        ctk.CTkButton(
+            q_top, text="🔁 Retry failed", font=(FONT, 11), width=100, height=24,
+            fg_color=COLORS["bg_input"], hover_color=COLORS["card_hover"],
+            border_width=1, border_color=COLORS["border"], corner_radius=8,
+            text_color=COLORS["warning"], command=self._retry_failed
+        ).pack(side="right", padx=(0, 6))
         self.queue_frame = ctk.CTkScrollableFrame(
             queue_card, fg_color="transparent", height=150,
             scrollbar_button_color=COLORS["border"],
@@ -1008,6 +1199,19 @@ class VideoDownloaderApp(ctk.CTk):
                                             text_color=COLORS["text_muted"], anchor="w")
             job.detail_label.pack(fill="x", padx=10, pady=(0, 6))
 
+    def _retry_failed(self):
+        failed = [j for j in self.jobs if j.status == "failed"]
+        if not failed:
+            self._set_status("Nothing to retry", COLORS["text_secondary"])
+            return
+        for j in failed:
+            if j.row is not None:
+                j.row.destroy()
+        self.jobs = [j for j in self.jobs if j.status != "failed"]
+        self.url_box.delete("1.0", "end")
+        self.url_box.insert("1.0", "\n".join(j.url for j in failed) + "\n")
+        self._start_download()
+
     def _clear_finished(self):
         keep = []
         for job in self.jobs:
@@ -1115,9 +1319,16 @@ class VideoDownloaderApp(ctk.CTk):
     def _truncate_path(self, path, max_len=45):
         return path if len(path) <= max_len else "..." + path[-(max_len - 3):]
 
+    LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stellar.log")
+
     def _log(self, msg):
         self.log_box.insert("end", msg + "\n")
         self.log_box.see("end")
+        try:
+            with open(self.LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(time.strftime("%H:%M:%S ") + msg + "\n")
+        except Exception:
+            pass
 
     def _log_safe(self, msg):
         self.after(0, lambda: self._log(msg))
@@ -1189,7 +1400,7 @@ class VideoDownloaderApp(ctk.CTk):
             "no_warnings": True,
             "noprogress": True,                   # the queue rows show progress instead
             "progress_hooks": [lambda d, j=job: self._ydl_progress_hook(d, j)] if job else [],
-            "concurrent_fragment_downloads": 4,   # faster HLS/DASH downloads
+            "concurrent_fragment_downloads": 8,   # parallel HLS/DASH fragments (more lanes only help when the server, not the line, is the cap)
             "overwrites": False,
             # Let the impersonated client supply User-Agent/Accept so they
             # match the TLS fingerprint (Cloudflare checks both).
@@ -1225,6 +1436,56 @@ class VideoDownloaderApp(ctk.CTk):
         if pp:
             opts["postprocessors"] = pp
         return opts
+
+    def _watch_partfiles(self, job, ydl, info, stop_event):
+        """
+        yt-dlp gets no progress back from aria2c, so poll the growing .part
+        file(s) on disk and feed their size to the job row until stop_event.
+        """
+        import glob
+        try:
+            base = os.path.splitext(ydl.prepare_filename(info))[0]
+        except Exception:
+            return
+        fmts = info.get("requested_formats") or [info]
+        total = sum((f.get("filesize") or f.get("filesize_approx") or 0) for f in fmts)
+        if not total:
+            # direct links often carry no size in the metadata: ask the server
+            for f in fmts:
+                try:
+                    r = requests.get(f["url"], headers=f.get("http_headers") or {},
+                                     stream=True, timeout=10)
+                    total += int(r.headers.get("content-length") or 0)
+                    r.close()
+                except Exception:
+                    pass
+        last_size, last_t = 0, time.time()
+        while not stop_event.wait(0.5):
+            try:
+                size = 0
+                parts = glob.glob(glob.escape(base) + "*.part")
+                for part in parts:
+                    prog = aria2_control_progress(part)
+                    if prog:
+                        size += prog[0]
+                        if not total:
+                            total = prog[1]
+                    else:
+                        size += os.path.getsize(part)
+            except Exception:
+                continue
+            if size <= 0:
+                continue
+            now = time.time()
+            speed = (size - last_size) / (now - last_t) if now > last_t else 0
+            last_size, last_t = size, now
+            parts = [f"{self._format_bytes(size)}" + (f" / {self._format_bytes(total)}" if total else "")]
+            if speed > 0:
+                parts.append(f"⚡ {self._format_bytes(speed)}/s")
+            if total and speed > 0:
+                parts.append(f"⏱ {timedelta(seconds=int((total - size) / speed))}")
+            self._job_update(job, pct=min(size / total, 0.99) if total else job.pct,
+                             detail="   •   ".join(parts), force=False)
 
     def _ydl_progress_hook(self, d, job):
         if job is None:
@@ -1329,31 +1590,69 @@ class VideoDownloaderApp(ctk.CTk):
         url = job.url
         log = lambda m: self._jlog(job, m)
 
+        host = urlparse(url).hostname or ""
+        if host and not DNSBypass.system_resolves(host):
+            ips = DNSBypass.doh_lookup(host)
+            if ips:
+                log(f"🚧 Your ISP's DNS blocks {host} → resolving via DNS-over-HTTPS ({ips[0]})")
+            else:
+                log(f"🚧 {host} does not resolve, even via DNS-over-HTTPS; the site may be down")
+
         # ── ENGINE 1: yt-dlp ──────────────────────────────
         log("")
         log("⚡ ━━━ ENGINE 1: yt-dlp ━━━━━━━━━━━━━━━━━━━━━━━")
         self._job_update(job, engine="Engine 1: yt-dlp", detail="extracting...")
 
-        attempts = [("", {})]
+        # 1st try: fastest path (aria2c multi-connection for plain files).
+        # 2nd try: native downloader with the browser TLS fingerprint on EVERY
+        # request - needed when a CDN 403s anything that isn't a real browser.
+        fast = aria2c_opts()
+        if fast and host and not DNSBypass.system_resolves(host):
+            # aria2c uses Windows DNS, which is what's blocked: give it its own resolvers
+            fast = dict(fast, external_downloader_args={
+                "aria2c": fast["external_downloader_args"]["aria2c"]
+                + ["--async-dns=true", "--async-dns-server=1.1.1.1,8.8.8.8"]})
+        attempts = [(" (aria2c x16)" if fast else "", fast)]
         if impersonate_target():
-            # 2nd try: browser TLS fingerprint on EVERY request (page + video data),
-            # not just the generic extractor's page fetch.
             attempts.append((" (full browser impersonation)", {"impersonate": impersonate_target()}))
         for label, extra in attempts:
             try:
                 opts = dict(self._get_ydl_opts(job), **extra)
                 with yt_dlp.YoutubeDL(opts) as ydl:
+                    dl_url = url
                     info = ydl.extract_info(url, download=False)
+                    generic = {"generic", "html5", "html5mediaembed"}
+                    alt = strip_lang_prefix(url)
+                    if alt and str(info.get("extractor_key") or info.get("extractor") or "").lower() in generic:
+                        try:
+                            alt_info = ydl.extract_info(alt, download=False)
+                            if str(alt_info.get("extractor_key") or "").lower() not in generic:
+                                log(f"   ↪ {alt_info.get('extractor')} extractor matched the non-localised URL")
+                                info, dl_url = alt_info, alt
+                        except Exception:
+                            pass
                     title = info.get("title", "Unknown")
                     log(f"   ✓ Found: {title}{label}")
                     self._job_update(job, title=title, detail="downloading...")
-                    ydl.download([url])
+                    stop = threading.Event()
+                    watcher = None
+                    if "external_downloader" in opts:
+                        watcher = threading.Thread(target=self._watch_partfiles,
+                                                   args=(job, ydl, info, stop), daemon=True)
+                        watcher.start()
+                    try:
+                        ydl.download([dl_url])
+                    finally:
+                        stop.set()
+                        if watcher:
+                            watcher.join(timeout=2)
                 return True
             except Exception as e:
                 job.error = " ".join(str(e).split())[:150]
                 log(f"   ✗ {job.error}")
-                if "403" not in job.error and "forbidden" not in job.error.lower():
-                    break   # not an access problem; impersonating again won't help
+                err = job.error.lower()
+                if not any(k in err for k in ("403", "forbidden", "aria2c", "unable to download")):
+                    break   # not an access/downloader problem; retrying won't help
 
         # ── ENGINE 2: Playwright ──────────────────────────
         if self.playwright_available:
